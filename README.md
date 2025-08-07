@@ -58,8 +58,4 @@ The main components are:
   - **Analysis Prompt**: The prompt for invoice analysis is a template that provides the LLM with the reimbursement policy and invoice details. It instructs the LLM to respond with a structured format: `Status: <Status>` and `Reason: <Reason>` to facilitate programmatic parsing.
   - **Chatbot Prompt**: The chatbot's prompt is designed for a RAG system. It includes the user's query, a history of the conversation, and a context window populated with relevant documents retrieved from ChromaDB. This forces the LLM to ground its answers in the provided facts, preventing inaccuracies.
 
-#### **Challenges & Solutions**
 
-  - **Metadata Filtering**: A key challenge was efficiently querying the vector store based on non-text criteria (e.g., employee name or status). The `parse_metadata_from_query` function was created to extract these filters from the user's natural language query, which are then passed to ChromaDB's `where` parameter for a targeted search.
-  - **File Handling**: Handling file uploads, especially ZIP files, required robust logic to ensure the files were correctly saved and extracted. The `save_uploaded_files` function was refactored to directly handle the file-like object from the `UploadFile` instance, making it more reliable.
-  - **Robustness**: The application includes comprehensive logging using Python's `logging` module. This helps monitor the application's behavior and diagnose issues related to file parsing, API calls, or database operations.
