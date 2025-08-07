@@ -11,9 +11,8 @@ logs/
 .env
 
 # Sample data files
-*.zip
 *.docx
-*.pdf
+
 
 # Other IDE files
 .vscode/
