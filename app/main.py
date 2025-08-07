@@ -237,7 +237,7 @@ async def analyze_invoices_endpoint(
             
             storage_status = "skipped"
             if analysis["status"] == "success":
-                invoice_id = filename.split('.')[0]
+                invoice_id = os.path.basename(filename).split('.')[0] # Use os.path.basename to get filename from path
                 storage_success = create_embeddings_and_store(
                     invoice_id, 
                     invoice_text, 
@@ -293,9 +293,20 @@ def parse_metadata_from_query(query: str):
         query_text = query_text.replace(val, "").replace("from", "").replace("for", "").strip()
 
     return query_text, filters
+
 def build_chromadb_where(metadata_filters):
+    """
+    Dynamically builds a ChromaDB 'where' clause based on the number of filters.
+    """
     if not metadata_filters:
-        return {}
+        return {} # No filter needed
+    
+    # If there's only one filter, return it directly without $and
+    if len(metadata_filters) == 1:
+        key, value = list(metadata_filters.items())[0]
+        return {key: {"$eq": value}}
+    
+    # If there are multiple filters, use $and
     return {
         "$and": [
             {key: {"$eq": value}}
@@ -315,6 +326,7 @@ def rag_query(query_text: str, metadata_filters: dict, user_id: str):
         if chromadb_where:  # Only add 'where' if not empty
             query_args["where"] = chromadb_where
 
+        # The error occurred on this line
         results = invoice_collection.query(**query_args)
     except Exception as e:
         logger.error(f"Error querying ChromaDB with RAG for user '{user_id}': {e}", exc_info=True)
