@@ -1,0 +1,19 @@
+# Python cache and compiled files
+__pycache__/
+*.pyc
+
+# Virtual environment directory
+venv/
+
+# Application-specific directories and files
+invoices_db/
+logs/
+.env
+
+# Sample data files
+*.zip
+*.docx
+*.pdf
+
+# Other IDE files
+.vscode/
