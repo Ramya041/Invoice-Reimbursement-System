@@ -10,26 +10,84 @@ import chromadb
 from sentence_transformers import SentenceTransformer
 import uuid
 import re
+import logging
+import datetime
+import glob
 
+# --- App and Logging Configuration ---
 app = FastAPI()
+
+# Create a logs directory if it doesn't exist
+log_dir = "logs"
+if not os.path.exists(log_dir):
+    os.makedirs(log_dir)
+
+# Define the log file name with a timestamp
+log_file = os.path.join(log_dir, f"app_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.log")
+
+# Basic logging configuration
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(log_file),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# --- Groq and API setup ---
+load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+if not GROQ_API_KEY:
+    logger.error("GROQ_API_KEY environment variable not set.")
+    raise ValueError("GROQ_API_KEY environment variable not set.")
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# --- ChromaDB and Embedding Model setup ---
+client = chromadb.PersistentClient(path="./invoices_db")
+try:
+    invoice_collection = client.get_or_create_collection(name="invoice_analyses")
+    logger.info("ChromaDB collection 'invoice_analyses' is ready.")
+except Exception as e:
+    logger.critical(f"Error initializing ChromaDB: {e}", exc_info=True)
+    raise
+
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+logger.info("SentenceTransformer model 'all-MiniLM-L6-v2' loaded.")
+
 
 # --- File handling and PDF parsing functions ---
 async def save_uploaded_files(policy_file: UploadFile, invoice_zip: UploadFile):
     """Saves uploaded policy and invoice files to a temporary directory."""
     temp_dir = tempfile.mkdtemp()
     policy_path = os.path.join(temp_dir, "policy.pdf")
-    zip_path = os.path.join(temp_dir, "invoices.zip")
     invoices_dir = os.path.join(temp_dir, "invoices")
 
-    with open(policy_path, "wb") as f:
-        f.write(await policy_file.read())
-    with open(zip_path, "wb") as f:
-        f.write(await invoice_zip.read())
+    # Save policy file
+    try:
+        with open(policy_path, "wb") as f:
+            f.write(await policy_file.read())
+        logger.info(f"Policy file saved to: {policy_path}")
+    except Exception as e:
+        logger.error(f"Failed to save policy file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to save policy file.")
 
+    # Extract invoices directly from the UploadFile object
     os.makedirs(invoices_dir, exist_ok=True)
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(invoices_dir)
-
+    try:
+        with zipfile.ZipFile(invoice_zip.file, 'r') as zip_ref:
+            zip_ref.extractall(invoices_dir)
+        logger.info(f"Successfully extracted invoices to: {invoices_dir}")
+    except zipfile.BadZipFile:
+        logger.error("Uploaded file is not a valid zip file.")
+        raise HTTPException(status_code=400, detail="The uploaded invoice file is not a valid zip file.")
+    except Exception as e:
+        logger.error(f"Failed to extract zip file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to extract zip file: {e}")
+    
     return policy_path, invoices_dir
 
 def parse_pdf(file_path):
@@ -40,19 +98,11 @@ def parse_pdf(file_path):
             reader = PyPDF2.PdfReader(f)
             for page in reader.pages:
                 text += page.extract_text() or ""
+        logger.info(f"Successfully parsed PDF: {file_path}")
     except Exception as e:
-        print(f"Error parsing PDF {file_path}: {e}")
+        logger.error(f"Error parsing PDF {file_path}: {e}")
         return ""
     return text
-
-# --- Groq and API setup ---
-load_dotenv()
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
-if not GROQ_API_KEY:
-    raise ValueError("GROQ_API_KEY environment variable not set.")
-
-groq_client = Groq(api_key=GROQ_API_KEY)
 
 def analyze_invoice_with_groq(policy_text, invoice_text):
     """Analyzes a single invoice against a policy using the Groq API."""
@@ -75,6 +125,7 @@ def analyze_invoice_with_groq(policy_text, invoice_text):
     full_prompt = prompt_template.format(policy=policy_text, invoice=invoice_text)
     
     try:
+        logger.info("Calling Groq API for invoice analysis...")
         chat_completion = groq_client.chat.completions.create(
             messages=[
                 { "role": "user", "content": full_prompt }
@@ -84,22 +135,13 @@ def analyze_invoice_with_groq(policy_text, invoice_text):
         )
         
         content = chat_completion.choices[0].message.content
+        logger.info("Successfully received analysis from Groq API.")
         return {"status": "success", "analysis": content}
         
     except Exception as e:
         error_message = f"An error occurred with the Groq API: {e}"
-        print(f"DEBUG: {error_message}")
+        logger.error(error_message, exc_info=True)
         return {"status": "error", "message": error_message}
-
-# --- ChromaDB and Embedding Model setup ---
-client = chromadb.PersistentClient(path="./invoices_db")
-try:
-    invoice_collection = client.get_or_create_collection(name="invoice_analyses")
-except Exception as e:
-    print(f"Error initializing ChromaDB: {e}")
-    raise
-
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
 
 def create_embeddings_and_store(invoice_id, invoice_text, analysis_result, employee_name):
     """Generates embeddings and stores the data in ChromaDB."""
@@ -112,8 +154,12 @@ def create_embeddings_and_store(invoice_id, invoice_text, analysis_result, emplo
     date_match = re.search(r'Date:\s*(\d{4}-\d{2}-\d{2})', invoice_text)
     date_of_invoice = date_match.group(1) if date_match else "Unknown"
 
-    invoice_embedding = embedding_model.encode(invoice_text).tolist()
-    reason_embedding = embedding_model.encode(detailed_reason).tolist()
+    try:
+        invoice_embedding = embedding_model.encode(invoice_text).tolist()
+        reason_embedding = embedding_model.encode(detailed_reason).tolist()
+    except Exception as e:
+        logger.error(f"Error encoding embeddings for invoice {invoice_id}: {e}")
+        return False
 
     doc_id_base = str(uuid.uuid4())
     invoice_doc_id = f"{doc_id_base}-invoice"
@@ -141,10 +187,10 @@ def create_embeddings_and_store(invoice_id, invoice_text, analysis_result, emplo
             ],
             ids=[invoice_doc_id, reason_doc_id]
         )
-        print(f"Successfully stored analysis for invoice: {invoice_id}")
+        logger.info(f"Successfully stored analysis for invoice: {invoice_id}")
         return True
     except Exception as e:
-        print(f"Error storing data in ChromaDB: {e}")
+        logger.error(f"Error storing data in ChromaDB for invoice {invoice_id}: {e}", exc_info=True)
         return False
 
 # --- Part One: Main API Endpoint ---
@@ -159,18 +205,33 @@ async def analyze_invoices_endpoint(
     """
     temp_dir_to_clean = None
     results = []
+    logger.info(f"Received new request to analyze invoices for employee: {employee_name}")
     
     try:
         policy_path, invoices_dir = await save_uploaded_files(policy_file, invoice_zip)
         temp_dir_to_clean = os.path.dirname(invoices_dir)
         
         policy_text = parse_pdf(policy_path)
+        if not policy_text:
+            logger.warning("Could not extract text from policy PDF.")
+            raise HTTPException(status_code=400, detail="Could not extract text from policy PDF.")
         
-        invoice_files = [f for f in os.listdir(invoices_dir) if f.endswith(".pdf")]
+        invoice_files = glob.glob(os.path.join(invoices_dir, '**', '*.pdf'), recursive=True)
+        # [f for f in os.listdir(invoices_dir) if f.endswith(".pdf")]
+        logger.info(f"Found {len(invoice_files)} invoices in the zip file.")
+
+        if not invoice_files:
+            logger.warning("No PDF files found in the invoices zip file.")
+            return JSONResponse(content={"results": []})
         
         for filename in invoice_files:
+            logger.info(f"Processing invoice: {filename}")
             invoice_path = os.path.join(invoices_dir, filename)
             invoice_text = parse_pdf(invoice_path)
+            
+            if not invoice_text:
+                results.append({"invoice": filename, "employee": employee_name, "analysis": {"status": "error", "message": "Could not extract text from invoice PDF."}, "vector_store_status": "skipped"})
+                continue
             
             analysis = analyze_invoice_with_groq(policy_text, invoice_text)
             
@@ -194,13 +255,16 @@ async def analyze_invoices_endpoint(
 
         return JSONResponse(content={"results": results})
         
-    except zipfile.BadZipFile:
-        raise HTTPException(status_code=400, detail="The uploaded invoice file is not a valid zip file.")
+    except HTTPException:
+        # Re-raise HTTPExceptions to be handled by FastAPI
+        raise
     except Exception as e:
+        logger.critical(f"An unexpected error occurred during invoice analysis: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
     finally:
         if temp_dir_to_clean and os.path.exists(temp_dir_to_clean):
             shutil.rmtree(temp_dir_to_clean)
+            logger.info(f"Cleaned up temporary directory: {temp_dir_to_clean}")
 
 # --- Part Two: RAG Chatbot Endpoint ---
 # A simple in-memory store for chat history
@@ -209,69 +273,69 @@ chat_history = {}
 def parse_metadata_from_query(query: str):
     """
     Parses a user query to extract metadata filters.
-    e.g., "invoices for John Doe", "reimbursement status declined", "invoices from 2023-01-01"
     """
     filters = {}
     
-    # Employee name (simple regex, can be improved)
     name_match = re.search(r"for\s+([A-Za-z\s]+)", query, re.IGNORECASE)
     if name_match:
         filters["employee_name"] = name_match.group(1).strip()
     
-    # Reimbursement status
     status_match = re.search(r"(fully reimbursed|partially reimbursed|declined)", query, re.IGNORECASE)
     if status_match:
         filters["reimbursement_status"] = status_match.group(1).capitalize()
-        
-    # Date (simple regex for YYYY-MM-DD format)
+    
     date_match = re.search(r"from\s+(\d{4}-\d{2}-\d{2})", query, re.IGNORECASE)
     if date_match:
         filters["date"] = date_match.group(1)
-        
-    # Remove the parsed metadata from the query to get the core search text
+    
     query_text = query
     for val in filters.values():
         query_text = query_text.replace(val, "").replace("from", "").replace("for", "").strip()
 
     return query_text, filters
+def build_chromadb_where(metadata_filters):
+    if not metadata_filters:
+        return {}
+    return {
+        "$and": [
+            {key: {"$eq": value}}
+            for key, value in metadata_filters.items()
+        ]
+    }
 
 def rag_query(query_text: str, metadata_filters: dict, user_id: str):
-    """
-    Performs the RAG process:
-    1. Embeds the user query.
-    2. Performs a similarity search on ChromaDB with metadata filters.
-    3. Augments the LLM prompt with retrieved documents.
-    4. Calls the LLM to generate a response.
-    """
-    # 1. Embed the user query
-    query_embedding = embedding_model.encode(query_text).tolist()
+    try:
+        query_embedding = embedding_model.encode(query_text).tolist()
+        chromadb_where = build_chromadb_where(metadata_filters)
+        
+        query_args = {
+            "query_embeddings": [query_embedding],
+            "n_results": 10
+        }
+        if chromadb_where:  # Only add 'where' if not empty
+            query_args["where"] = chromadb_where
+
+        results = invoice_collection.query(**query_args)
+    except Exception as e:
+        logger.error(f"Error querying ChromaDB with RAG for user '{user_id}': {e}", exc_info=True)
+        return "An internal error occurred while retrieving information."
     
-    # 2. Perform similarity search with metadata filtering
-    results = invoice_collection.query(
-        query_embeddings=[query_embedding],
-        n_results=10,  # Retrieve top 10 results
-        where=metadata_filters  # Apply metadata filtering
-    )
-    
-    # 3. Augment the LLM prompt with retrieved documents
     retrieved_docs = results['documents'][0]
     
     if not retrieved_docs:
         context = "No relevant documents were found for this query."
+        logger.info(f"No documents found for RAG query from user '{user_id}'.")
     else:
-        # Create a formatted context string from the retrieved documents and their metadata
         context_parts = []
         for i in range(len(retrieved_docs)):
             doc = retrieved_docs[i]
             metadata = results['metadatas'][0][i]
             context_parts.append(f"--- Document {i+1} ---\nEmployee: {metadata.get('employee_name', 'N/A')}\nInvoice ID: {metadata.get('invoice_id', 'N/A')}\nStatus: {metadata.get('reimbursement_status', 'N/A')}\nDate: {metadata.get('date', 'N/A')}\nContent:\n{doc}\n--- End Document ---\n")
-        
         context = "\n".join(context_parts)
+        logger.info(f"Found {len(retrieved_docs)} relevant documents for RAG query from user '{user_id}'.")
 
-    # Check for previous conversation context
     previous_context = chat_history.get(user_id, "")
     
-    # 4. Call the LLM to generate a response
     llm_prompt = f"""
     You are an AI assistant designed to answer questions about invoice reimbursement analyses.
     Use the following retrieved information and your previous conversation history to answer the user's query.
@@ -298,20 +362,20 @@ def rag_query(query_text: str, metadata_filters: dict, user_id: str):
             temperature=0.3
         )
         response_content = chat_completion.choices[0].message.content
-        
-        # Update chat history
         chat_history[user_id] = f"{previous_context}\nUser: {query_text}\nAI: {response_content}"
-        
+        logger.info(f"Chatbot response generated for user '{user_id}'.")
         return response_content
     except Exception as e:
-        print(f"An error occurred with the Groq API during chat: {e}")
+        logger.error(f"An error occurred with the Groq API during chat for user '{user_id}': {e}", exc_info=True)
         return "Sorry, I am unable to process your request at this time."
 
 @app.post("/chat/")
-async def chat_endpoint(query: str, user_id: str = Form(...)):
+async def chat_endpoint(
+    query: str = Form(...),
+    user_id: str = Form(...)
+):
     """
     RAG LLM Chatbot Endpoint.
-    Accepts a user query, performs RAG, and returns a formatted response.
     """
     try:
         query_text, metadata_filters = parse_metadata_from_query(query)
@@ -319,6 +383,7 @@ async def chat_endpoint(query: str, user_id: str = Form(...)):
         
         return JSONResponse(content={"response": response})
     except Exception as e:
+        logger.critical(f"An unexpected error occurred in the chat endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred: {e}")
 
 if __name__ == "__main__":
